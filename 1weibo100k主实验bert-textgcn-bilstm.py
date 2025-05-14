@@ -23,7 +23,6 @@ class WeiboDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
         self.slang_mapping = slang_mapping
-        self.vocab_size = tokenizer.vocab_size  # 使用tokenizer的词汇表大小
 
     def __len__(self):
         return len(self.data)
@@ -47,25 +46,6 @@ class WeiboDataset(Dataset):
 
         input_ids = encoded_text['input_ids'].flatten()
         attention_mask = encoded_text['attention_mask'].flatten()
-
-        # 验证和修正输入ID
-        if torch.any(input_ids < 0) or torch.any(input_ids >= self.vocab_size):
-            invalid_mask = (input_ids < 0) | (input_ids >= self.vocab_size)
-            invalid_count = invalid_mask.sum().item()
-            print(f"样本 {index}: 发现 {invalid_count} 个无效输入ID，词汇表大小: {self.vocab_size}")
-            
-            # 记录无效ID的位置和值
-            if invalid_count < 10:  # 只打印少量无效ID，避免过多输出
-                invalid_indices = torch.nonzero(invalid_mask, as_tuple=True)
-                for i, j in zip(*invalid_indices):
-                    print(f"无效ID位置: [{i}, {j}], 值: {input_ids[i, j]}")
-                    # 尝试解码无效ID，帮助诊断问题
-                    if input_ids[i, j] < self.vocab_size:
-                        print(f"无效ID对应的token: {self.tokenizer.convert_ids_to_tokens([input_ids[i, j].item()])}")
-            
-            # 修正超出范围的ID为[UNK]标记 (通常是100)
-            input_ids[input_ids < 0] = 100
-            input_ids[input_ids >= self.vocab_size] = 100
 
         return {
             'input_ids': input_ids,
@@ -259,25 +239,6 @@ class BERT_TextGCN_BiLSTM(nn.Module):
         self.adj_matrix = None
 
     def forward(self, input_ids, attention_mask, edge_index):
-        # 验证输入ID是否在词汇表范围内
-        if torch.any(input_ids >= self.vocab_size) or torch.any(input_ids < 0):
-            invalid_mask = (input_ids >= self.vocab_size) | (input_ids < 0)
-            invalid_count = invalid_mask.sum().item()
-            print(f"警告: 发现 {invalid_count} 个无效输入ID，词汇表大小: {self.vocab_size}")
-            
-            # 记录无效ID的位置和值
-            if invalid_count < 10:  # 只打印少量无效ID，避免过多输出
-                invalid_indices = torch.nonzero(invalid_mask, as_tuple=True)
-                for i, j in zip(*invalid_indices):
-                    print(f"无效ID位置: [{i}, {j}], 值: {input_ids[i, j]}")
-                    # 尝试解码无效ID，帮助诊断问题
-                    if input_ids[i, j] < self.vocab_size:
-                        print(f"无效ID对应的token: {self.bert.tokenizer.convert_ids_to_tokens([input_ids[i, j].item()])}")
-            
-            # 修正超出范围的ID为[UNK]标记 (通常是100)
-            input_ids[input_ids < 0] = 100
-            input_ids[input_ids >= self.vocab_size] = 100
-
         # BERT Embedding
         bert_output = self.bert(input_ids, attention_mask=attention_mask)
         bert_embedding = bert_output.last_hidden_state
@@ -286,16 +247,8 @@ class BERT_TextGCN_BiLSTM(nn.Module):
         x = self.embedding(input_ids)  # input_ids 作为节点特征
         # 残差连接
         x_initial = self.input_linear(x)  # 将输入特征映射到 GCN 隐藏层维度
-        
-        # 确保图结构有效
-        edge_index = ensure_valid_graph(edge_index, x.size(0))
-        
         x = F.relu(self.gcn1(x, edge_index))
         x = x + x_initial  # 残差连接
-        
-        # 再次确保图结构有效
-        edge_index = ensure_valid_graph(edge_index, x.size(0))
-        
         x = F.relu(self.gcn2(x, edge_index))
 
         # 情感强度预测
@@ -343,153 +296,22 @@ class BERT_TextGCN_BiLSTM(nn.Module):
 
         return edge_index
 
-# 确保图结构有效（无孤立节点）
-def ensure_valid_graph(edge_index, num_nodes):
-    # 检查图是否包含孤立节点
-    if edge_index.numel() > 0:
-        # 计算每个节点的度
-        deg = torch.zeros(num_nodes, dtype=torch.long, device=edge_index.device)
-        src, dst = edge_index
-        deg.scatter_add_(0, src, torch.ones_like(src, dtype=torch.long, device=edge_index.device))
-        deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.long, device=edge_index.device))
-        
-        # 检查是否有度为0的节点
-        if torch.any(deg == 0):
-            print(f"发现 {torch.sum(deg == 0)} 个孤立节点，添加自环")
-            # 为每个孤立节点添加自环
-            isolated_nodes = torch.nonzero(deg == 0, as_tuple=True)[0]
-            if len(isolated_nodes) > 0:
-                self_loops = torch.stack([isolated_nodes, isolated_nodes], dim=0)
-                edge_index = torch.cat([edge_index, self_loops], dim=1)
-    else:
-        # 如果没有边，则创建一个自环图
-        edge_index = torch.arange(num_nodes, dtype=torch.long, device=edge_index.device).repeat(2, 1)
-        print(f"创建了自环图，节点数: {num_nodes}")
-    
-    return edge_index
-
 # 7. 训练代码
 def train(model, data_loader, optimizer, device, build_graph, tokenizer, class_weights, lambda_1, lambda_2, lambda_3):
     model.train()
     total_loss = 0
-    batch_count = 0
     for batch in data_loader:
-        input_ids = batch['input_ids']
-        attention_mask = batch['attention_mask']
-        sentiment = batch['sentiment']
-
-        # 验证输入ID
-        if torch.any(input_ids < 0) or torch.any(input_ids >= tokenizer.vocab_size):
-            invalid_mask = (input_ids < 0) | (input_ids >= tokenizer.vocab_size)
-            invalid_count = invalid_mask.sum().item()
-            print(f"Batch {batch_count}: 发现 {invalid_count} 个无效输入ID，词汇表大小: {tokenizer.vocab_size}")
-            
-            # 记录无效ID的位置和值
-            if invalid_count < 10:  # 只打印少量无效ID，避免过多输出
-                invalid_indices = torch.nonzero(invalid_mask, as_tuple=True)
-                for i, j in zip(*invalid_indices):
-                    print(f"无效ID位置: [{i}, {j}], 值: {input_ids[i, j]}")
-                    # 尝试解码无效ID，帮助诊断问题
-                    if input_ids[i, j] < tokenizer.vocab_size:
-                        print(f"无效ID对应的token: {tokenizer.convert_ids_to_tokens([input_ids[i, j].item()])}")
-            
-            # 修正无效ID为[UNK]标记
-            input_ids[input_ids < 0] = tokenizer.unk_token_id
-            input_ids[input_ids >= tokenizer.vocab_size] = tokenizer.unk_token_id
-
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        sentiment = sentiment.to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        sentiment = batch['sentiment'].to(device)
 
         # 计算动态图
         corpus = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-        edge_index, word_index = build_graph(corpus, tokenizer)  # 获取 edge_index，忽略 word_index
-        
-        # 验证 edge_index
-        if edge_index.numel() > 0:
-            if torch.max(edge_index) >= len(word_index):
-                print(f"Batch {batch_count}: 发现 edge_index 中的值 >= 词汇表大小 ({len(word_index)})")
-                print(f"edge_index 最大值: {torch.max(edge_index)}")
-                edge_index = torch.clamp(edge_index, 0, len(word_index) - 1)
-            if torch.min(edge_index) < 0:
-                print(f"Batch {batch_count}: 发现 edge_index 中的负值")
-                print(f"edge_index 最小值: {torch.min(edge_index)}")
-                edge_index = torch.clamp(edge_index, 0, len(word_index) - 1)
-
-        edge_index = ensure_valid_graph(edge_index, len(word_index))
+        edge_index, _ = build_graph(corpus, tokenizer)  # 获取 edge_index，忽略 word_index
         edge_index = edge_index.to(device)
 
         optimizer.zero_grad()
-        try:
-            outputs = model(input_ids, attention_mask, edge_index)
-        except Exception as e:
-            print(f"Batch {batch_count}: 前向传播错误: {e}")
-            print(f"输入ID范围: min={torch.min(input_ids)}, max={torch.max(input_ids)}")
-            print(f"edge_index范围: min={torch.min(edge_index)}, max={torch.max(edge_index)}")
-            print(f"词汇表大小: {model.vocab_size}")
-            
-            # 尝试识别问题来源
-            try:
-                # 检查BERT部分
-                _ = model.bert(input_ids, attention_mask=attention_mask)
-                print("BERT部分运行正常")
-                
-                # 检查GCN部分
-                x = model.embedding(input_ids)
-                x_initial = model.input_linear(x)
-                
-                # 手动执行GCN归一化，确保处理了孤立节点
-                edge_index_gcn = ensure_valid_graph(edge_index, x.size(0))
-                from torch_geometric.utils import add_self_loops, degree
-                edge_index_gcn, _ = add_self_loops(edge_index_gcn, num_nodes=x.size(0))
-                row, col = edge_index_gcn
-                deg = degree(col, x.size(0), dtype=x.dtype)
-                deg_inv_sqrt = deg.pow_(-0.5)
-                deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)  # 处理除零情况
-                edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-                
-                x_gcn = F.relu(model.gcn1(x, edge_index_gcn, edge_weight))
-                print("GCN第一层运行正常")
-                
-                # 对第二层执行相同的检查
-                edge_index_gcn = ensure_valid_graph(edge_index, x_gcn.size(0))
-                edge_index_gcn, _ = add_self_loops(edge_index_gcn, num_nodes=x_gcn.size(0))
-                row, col = edge_index_gcn
-                deg = degree(col, x_gcn.size(0), dtype=x_gcn.dtype)
-                deg_inv_sqrt = deg.pow_(-0.5)
-                deg_inv_sqrt.masked_fill_(deg_inv_sqrt == float('inf'), 0)  # 处理除零情况
-                edge_weight = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-                
-                x_gcn = F.relu(model.gcn2(x_gcn, edge_index_gcn, edge_weight))
-                print("GCN第二层运行正常")
-                
-                # 检查情感强度预测
-                sentiment_input = x_gcn.permute(0, 2, 1)
-                sentiment_output = F.relu(model.sentiment_conv1(sentiment_input))
-                sentiment_output = F.relu(model.sentiment_conv2(sentiment_output))
-                sentiment_output = sentiment_output.view(sentiment_output.size(0), -1)
-                sentiment_output = F.relu(model.sentiment_fc(sentiment_output))
-                sentiment_intensity = model.sentiment_output(sentiment_output)
-                sentiment_intensity = torch.sigmoid(sentiment_intensity)
-                print("情感强度预测运行正常")
-                
-                # 检查BiLSTM
-                bilstm_output = model.bilstm(x_gcn, sentiment_intensity)
-                print("BiLSTM运行正常")
-                
-                # 检查注意力机制
-                attended_output = model.attention(bilstm_output, sentiment_intensity)
-                print("注意力机制运行正常")
-                
-                # 检查DNN
-                _ = model.dnn(attended_output, model.class_weights)
-                print("DNN运行正常")
-                
-                print("问题可能出在这些组件之间的交互")
-            except Exception as inner_e:
-                print(f"组件测试失败: {inner_e}")
-            
-            continue  # 跳过当前批次
+        outputs = model(input_ids, attention_mask, edge_index)
 
         # 1. 加权交叉熵损失
         L_bal = F.cross_entropy(outputs, sentiment, weight=class_weights)
@@ -520,9 +342,8 @@ def train(model, data_loader, optimizer, device, build_graph, tokenizer, class_w
         optimizer.step()
 
         total_loss += L_total.item()
-        batch_count += 1
 
-    return total_loss / max(1, batch_count)
+    return total_loss / len(data_loader)
 
 # 8. 评估代码
 def evaluate(model, data_loader, device, build_graph, tokenizer, dataset_type="Validation"):
@@ -535,25 +356,9 @@ def evaluate(model, data_loader, device, build_graph, tokenizer, dataset_type="V
             attention_mask = batch['attention_mask'].to(device)
             sentiment = batch['sentiment'].to(device)
 
-            # 验证输入ID
-            if torch.any(input_ids < 0) or torch.any(input_ids >= tokenizer.vocab_size):
-                print(f"评估阶段: 发现无效输入ID")
-                input_ids = torch.clamp(input_ids, 0, tokenizer.vocab_size - 1)
-
             # 计算动态图
             corpus = [tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            edge_index, word_index = build_graph(corpus, tokenizer)  # 获取 edge_index，忽略 word_index
-            
-            # 验证 edge_index
-            if edge_index.numel() > 0:
-                if torch.max(edge_index) >= len(word_index):
-                    print(f"评估阶段: 发现 edge_index 中的值 >= 词汇表大小 ({len(word_index)})")
-                    edge_index = torch.clamp(edge_index, 0, len(word_index) - 1)
-                if torch.min(edge_index) < 0:
-                    print(f"评估阶段: 发现 edge_index 中的负值")
-                    edge_index = torch.clamp(edge_index, 0, len(word_index) - 1)
-
-            edge_index = ensure_valid_graph(edge_index, len(word_index))
+            edge_index, _ = build_graph(corpus, tokenizer)  # 获取 edge_index，忽略 word_index
             edge_index = edge_index.to(device)
 
             outputs = model(input_ids, attention_mask, edge_index)
@@ -593,12 +398,6 @@ def build_graph(corpus, tokenizer):
         tokens = tokenizer.tokenize(text)
         word_counts.update(tokens)
 
-    # 确保词汇表包含所有特殊token
-    special_tokens = ['[CLS]', '[SEP]', '[PAD]', '[UNK]']
-    for token in special_tokens:
-        if token not in word_counts:
-            word_counts[token] = 1  # 添加特殊token
-
     word_index = {word: i for i, word in enumerate(word_counts.keys())}
     num_nodes = len(word_index)
 
@@ -608,20 +407,16 @@ def build_graph(corpus, tokenizer):
         for i in range(len(tokens) - 1):
             word1 = tokens[i]
             word2 = tokens[i + 1]
-            if word1 in word_index and word2 in word_index:
-                index1 = word_index[word1]
-                index2 = word_index[word2]
-                edges.append((index1, index2))
-                edges.append((index2, index1))  # 无向图
+            index1 = word_index[word1]
+            index2 = word_index[word2]
+            edges.append((index1, index2))
+            edges.append((index2, index1))  # 无向图
 
     # 去重
     edges = list(set(edges))
-    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.empty((2, 0), dtype=torch.long)
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
 
-    # 处理孤立节点
-    edge_index = ensure_valid_graph(edge_index, num_nodes)
-
-    return edge_index, word_index
+    return edge_index, word_index  # 返回 word_index
 
 # 10. 文本清洗函数
 def clean_text(text, slang_mapping):
@@ -630,7 +425,7 @@ def clean_text(text, slang_mapping):
 
     # 使用 slang_mapping 替换网络用语
     for slang, standard in slang_mapping.items():
-        text = text.replace(slang, standard)
+        text = text = text.replace(slang, standard)
 
     # 去除##之间的内容以及#
     text = re.sub(r'#.*?#', '', text)
@@ -641,8 +436,8 @@ def clean_text(text, slang_mapping):
     # 去除超链接
     text = re.sub(r'http\S+', '', text)
 
-    # 保留中文、数字和基本标点符号
-    text = "".join(re.findall(u'[\u4e00-\u9fa50-9，。！？、：；,.?!:;]', str(text)))
+    # 去除特殊字符，只保留中文
+    text = "".join(re.findall(u'[\u4e00-\u9fa5]', str(text)))
 
     # 去除多余空格
     text = text.strip()
@@ -679,6 +474,7 @@ def main():
     tokenizer = BertTokenizer.from_pretrained(bert_model_name)
     df = pd.read_csv('weibo_senti_100k.csv', encoding='utf-8')  # 修改为您的数据集路径
     df = df[['review', 'label']]  # 确保列名正确
+    # df.columns = ['text', 'label']  # 移除这行
 
     # 划分训练集、验证集和测试集
     train_df, temp_df = train_test_split(df, test_size=(validation_size + test_size), random_state=42)
@@ -694,119 +490,25 @@ def main():
     class_counts = Counter(train_labels)
     total_samples = len(train_labels)
     class_weights = torch.tensor([total_samples / class_counts[c] for c in range(num_classes)], dtype=torch.float).to(device)
-    print(f"类别权重: {class_weights}")
 
-    # 网络用语映射表
-    slang_mapping = {    # 网络用语映射表
+    # 构建图结构
+    corpus = train_df['review'].tolist()  # 修改为 'review'
+    edge_index, word_index = build_graph(corpus, tokenizer)  # 获取 edge_index 和 word_index
+    edge_index = edge_index.to(device)
+    vocab_size = len(word_index)
+
+    # 定义 slang_mapping
     slang_mapping = {
-        'yyds': '永远的神',
-        '绝绝子': '太绝了',
-        'awsl': '啊我死了',
-        '集美': '姐妹',
-        '杠精': '爱抬杠的人',
-        '佛系': '无所谓',
-        '躺平': '放弃努力',
-        '内卷': '过度竞争',
-        '摆烂': '破罐子破摔',
-        'emo': '情绪低落',
-        '奥利给': '加油',
-        '好家伙': '表示惊讶',
-        '666': '很厉害',
-        '瑟瑟发抖': '害怕',
-        '吃瓜': '看热闹',
-        '凡尔赛': '炫耀',
-        'yygq': '阴阳怪气',
-        '打工人': '劳动者',
-        '干饭人': '热爱吃饭的人',
-        '绝了': '太棒了',
-        '笑死我了': '太搞笑了',
-        '裂开': '心态崩了',
-        '淦': '干',
-        '躺赢': '不努力却成功',
-        'CP': '情侣组合',
-        '嗑CP': '支持情侣',
-        '雷人': '令人震惊',
-        '种草': '推荐',
-        '拔草': '不推荐',
-        '上头': '沉迷',
-        '冲': '行动',
-        '奥利给': '加油',
-        '好家伙': '表示惊讶',
-        '绝绝子': '太绝了',
-        'YYDS': '永远的神',
-        'NB': '厉害',
-        'SB': '傻子',
-        '佛系': '无所谓',
-        '躺平': '放弃努力',
-        '内卷': '过度竞争',
-        '摆烂': '破罐子破摔',
-        'emo': '情绪低落',
-        'yyds': '永远的神',
-        'awsl': '啊我死了',
-        '集美': '姐妹',
-        '杠精': '爱抬杠的人',
-        '666': '很厉害',
-        '瑟瑟发抖': '害怕',
-        '吃瓜': '看热闹',
-        '凡尔赛': '炫耀',
-        'yygq': '阴阳怪气',
-        '打工人': '劳动者',
-        '干饭人': '热爱吃饭的人',
-        '绝了': '太棒了',
-        '笑死我了': '太搞笑了',
-        '裂开': '心态崩了',
-        '淦': '干',
-        '躺赢': '不努力却成功',
-        'CP': '情侣组合',
-        '嗑CP': '支持情侣',
-        '雷人': '令人震惊',
-        '种草': '推荐',
-        '拔草': '不推荐',
-        '上头': '沉迷',
-        '冲': '行动',
-        '奥利给': '加油',
-        '好家伙': '表示惊讶',
-        '绝绝子': '太绝了',
-        'YYDS': '永远的神',
-        'NB': '厉害',
-        'SB': '傻子',
-        '佛系': '无所谓',
-        '躺平': '放弃努力',
-        '内卷': '过度竞争',
-        '摆烂': '破罐子破摔',
-        'emo': '情绪低落',
-        'yyds': '永远的神',
-        'awsl': '啊我死了',
-        '集美': '姐妹',
-        '杠精': '爱抬杠的人',
-        '666': '很厉害',
-        '瑟瑟发抖': '害怕',
-        '吃瓜': '看热闹',
-        '凡尔赛': '炫耀',
-        'yygq': '阴阳怪气',
-        '打工人': '劳动者',
-        '干饭人': '热爱吃饭的人',
-        '绝了': '太棒了',
-        '笑死我了': '太搞笑了',
-        '裂开': '心态崩了',
-        '淦': '干',
-        '躺赢': '不努力却成功',
-        'CP': '情侣组合',
-        '嗑CP': '支持情侣',
-        '雷人': '令人震惊',
-        '种草': '推荐',
-        '拔草': '不推荐',
-        '上头': '沉迷',
-        '冲': '行动',
-        '奥利给': '加油',
-        '好家伙': '表示惊讶',
-        '绝绝子': '太绝了',
-        'YYDS': '永远的神',
-        'NB': '厉害',
-        'SB': '傻子',
+        '233': '笑',  # 网络用语，表示大笑
+        '666': '厉害', # 网络用语，表示很棒
+        'orz': '失落', # 表情符号，表示沮丧
+        'plz': '请',   # 英文缩写
+        'thx': '谢谢',  # 英文缩写
+        '泥垢': '你够了', # 方言谐音
+        '表酱紫': '不要这样', # 卖萌说法
+        '果咩': '抱歉', # 日语谐音
     }
 
-    # 创建数据集和数据加载器
     train_dataset = WeiboDataset(train_df, tokenizer, max_len, slang_mapping)
     val_dataset = WeiboDataset(val_df, tokenizer, max_len, slang_mapping)
     test_dataset = WeiboDataset(test_df, tokenizer, max_len, slang_mapping)
@@ -815,84 +517,65 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
 
-    # 初始化模型
-    model = BERT_TextGCN_BiLSTM(
-        bert_model_name=bert_model_name,
-        gcn_hidden_dim=gcn_hidden_dim,
-        lstm_hidden_dim=lstm_hidden_dim,
-        num_classes=num_classes,
-        vocab_size=tokenizer.vocab_size,
-        embedding_dim=embedding_dim,
-        sentiment_conv_filters=sentiment_conv_filters,
-        sentiment_fc_dim=sentiment_fc_dim,
-        class_weights=class_weights
-    ).to(device)
-
-    # 冻结BERT的部分参数
-    for param in list(model.bert.parameters())[:-10]:  # 只微调最后几层
-        param.requires_grad = False
+    # 模型初始化
+    model = BERT_TextGCN_BiLSTM(bert_model_name, gcn_hidden_dim, lstm_hidden_dim, num_classes, vocab_size, embedding_dim,
+                                 sentiment_conv_filters, sentiment_fc_dim, class_weights).to(device)
 
     # 优化器
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
     # 学习率调度器
     scheduler = StepLR(optimizer, step_size=step_size, gamma=gamma)
 
-    # 训练循环
-    best_val_f1 = 0.0
+    # 记录损失和准确率
+    train_losses = []
+    val_accuracies = []
+
+    # 训练
+    best_val_accuracy = 0.0  # 初始化最佳验证集准确率
     for epoch in range(epochs):
-        print(f'Epoch {epoch+1}/{epochs}')
-        print('-' * 30)
+        train_loss = train(model, train_loader, optimizer, device, build_graph, tokenizer, class_weights, lambda_1, lambda_2, lambda_3)
+        print(f'Epoch {epoch + 1}, Train Loss: {train_loss:.4f}')
 
-        # 训练阶段
-        train_loss = train(
-            model=model,
-            data_loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            build_graph=build_graph,
-            tokenizer=tokenizer,
-            class_weights=class_weights,
-            lambda_1=lambda_1,
-            lambda_2=lambda_2,
-            lambda_3=lambda_3
-        )
-        print(f'Training Loss: {train_loss:.4f}')
+        # 评估验证集
+        val_accuracy, val_precision, val_recall, val_f1 = evaluate(model, val_loader, device, build_graph, tokenizer, dataset_type="Validation")
 
-        # 验证阶段
-        val_accuracy, val_precision, val_recall, val_f1 = evaluate(
-            model=model,
-            data_loader=val_loader,
-            device=device,
-            build_graph=build_graph,
-            tokenizer=tokenizer,
-            dataset_type="Validation"
-        )
+        # 记录损失和准确率
+        train_losses.append(train_loss)
+        val_accuracies.append(val_accuracy)
+
+        # 如果验证集准确率提高，则保存模型
+        if val_accuracy > best_val_accuracy:
+            best_val_accuracy = val_accuracy
+            torch.save(model.state_dict(), 'best_model.pth')  # 保存最佳模型
 
         # 学习率衰减
         scheduler.step()
 
-        # 保存最佳模型
-        if val_f1 > best_val_f1:
-            best_val_f1 = val_f1
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f'Best model saved with F1 score: {best_val_f1:.4f}')
+    # 绘制损失和准确率曲线图
+    plt.figure(figsize=(12, 6))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Train Loss vs. Epoch')
+    plt.legend()
 
-        print()
+    plt.subplot(1, 2, 2)
+    plt.plot(val_accuracies, label='Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.title('Validation Accuracy vs. Epoch')
+    plt.legend()
 
-    # 在测试集上评估最佳模型
-    print('Evaluating on test set...')
+    plt.savefig('loss_accuracy_curves.png')  # 保存图像
+    plt.show()
+
+    # 加载最佳模型
     model.load_state_dict(torch.load('best_model.pth'))
-    test_accuracy, test_precision, test_recall, test_f1 = evaluate(
-        model=model,
-        data_loader=test_loader,
-        device=device,
-        build_graph=build_graph,
-        tokenizer=tokenizer,
-        dataset_type="Test"
-    )
 
-    print('Training and evaluation completed!')
+    # 在测试集上评估模型
+    test_accuracy, test_precision, test_recall, test_f1 = evaluate(model, test_loader, device, build_graph, tokenizer, dataset_type="Test")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
